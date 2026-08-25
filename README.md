@@ -6,4 +6,4 @@ Un device di controllo (`/dev/pubsub`) permette di creare/eliminare topic. Ogni 
 
 Il progetto confronta sperimentalmente due strategie di sincronizzazione per l'elenco dei subscriber (**RCU vs rwlock_t**), misurando throughput e latenza al variare del numero di publisher/subscriber.
 
-**File**: `module.c` (modulo kernel), `benchmark.c` (benchmark userspace), `Makefile`.
+**File**: `pubsub.c` (modulo kernel), `pubsub_test.c` (benchmark userspace), `pubsub_ioctl.h` (gestione ioctl, incluso dagli altri file C), `Makefile`.
