@@ -9,16 +9,97 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/list.h>
+#include <linux/idr.h>
 #include "pubsub_ioctl.h"
+
+#define PUBSUB_MAX_TOPICS 256
 
 // Lista dei topic attivi protetta da mutex
 struct topic {
     char name[PUBSUB_MAX_NAME_LEN];
     struct list_head list;
+    dev_t dev_num;
+    struct cdev cdev;
+    struct device *device;
 };
 
 static LIST_HEAD(topic_list);
 static DEFINE_MUTEX(topic_list_mutex);
+
+// Variabili globali
+static dev_t dev_num;
+static dev_t pubsub_base_devt;
+static struct cdev pubsub_cdev;
+static struct class *pubsub_class;
+static DEFINE_IDA(pubsub_minor_ida);
+
+static int topic_open(struct inode *inode, struct file *file)
+{
+    struct topic *t = container_of(inode->i_cdev, struct topic, cdev);
+
+    file->private_data = t;
+
+    if ((file->f_flags & O_ACCMODE) == O_WRONLY)
+        pr_info("pubsub: publisher connesso al topic '%s'\n", t->name);
+    else if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+        pr_info("pubsub: subscriber connesso al topic '%s'\n", t->name);
+
+    return 0;
+}
+
+static int topic_release(struct inode *inode, struct file *file)
+{
+    return 0;
+}
+
+static struct file_operations topic_fops = {
+    .owner = THIS_MODULE,
+    .open = topic_open,
+    .release = topic_release,
+};
+
+static int pubsub_topic_device_create(struct topic *t)
+{
+    int minor;
+    int ret;
+
+    // Alloca un minor number per il topic
+    minor = ida_alloc_range(&pubsub_minor_ida, 1, PUBSUB_MAX_TOPICS, GFP_KERNEL);
+    if (minor < 0)
+        return minor;
+
+    t->dev_num = MKDEV(MAJOR(pubsub_base_devt), minor);
+
+    // Inizializza la struttura cdev per il topic
+    cdev_init(&t->cdev, &topic_fops);
+    t->cdev.owner = THIS_MODULE;
+
+    // Aggiunge la struttura cdev al kernel
+    ret = cdev_add(&t->cdev, t->dev_num, 1);
+    if (ret < 0) {
+        ida_free(&pubsub_minor_ida, minor);
+        return ret;
+    }
+
+    // Crea il device per il topic
+    t->device = device_create(pubsub_class, NULL, t->dev_num, NULL, "pubsub/%s", t->name);
+    if (IS_ERR(t->device)) {
+        ret = PTR_ERR(t->device);
+        cdev_del(&t->cdev);
+        ida_free(&pubsub_minor_ida, minor);
+        return ret;
+    }
+
+    return 0;
+}
+
+static void pubsub_topic_device_destroy(struct topic *t)
+{
+    // Rimuove il device per il topic
+    device_destroy(pubsub_class, t->dev_num);
+    cdev_del(&t->cdev);
+    ida_free(&pubsub_minor_ida, MINOR(t->dev_num));
+}
 
 static int pubsub_open(struct inode *inode, struct file *file)
 {
@@ -33,6 +114,7 @@ static int pubsub_release(struct inode *inode, struct file *file)
 static int pubsub_create_topic(struct pubsub_topic_req *topic_req)
 {
     struct topic *t;
+    int ret;
 
     // Verifica che il nome sia non nullo
     if (!topic_req || !topic_req->name[0]) {
@@ -59,6 +141,15 @@ static int pubsub_create_topic(struct pubsub_topic_req *topic_req)
     // Copia il nome del topic
     strscpy(t->name, topic_req->name, PUBSUB_MAX_NAME_LEN);
 
+    // Crea il device per il topic
+    ret = pubsub_topic_device_create(t);
+    if (ret < 0) {
+        mutex_unlock(&topic_list_mutex);
+        kfree(t);
+        return ret;
+    }
+
+
     // Inserisce il topic nella lista
     list_add_tail(&t->list, &topic_list);
     
@@ -78,6 +169,7 @@ static int pubsub_destroy_topic(struct pubsub_topic_req *topic_req)
         if (strncmp(t->name, topic_req->name, PUBSUB_MAX_NAME_LEN) == 0) {
             list_del(&t->list);
             mutex_unlock(&topic_list_mutex);
+            pubsub_topic_device_destroy(t);
             kfree(t);
             return 0;
         }
@@ -139,10 +231,6 @@ static long pubsub_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     return ret;
 }
 
-static dev_t dev_num;
-static struct cdev pubsub_cdev;
-static struct class *pubsub_class;
-
 static struct file_operations pubsub_fops = {
     .owner = THIS_MODULE,
     .open = pubsub_open,
@@ -156,11 +244,12 @@ static int __init pubsub_init(void)
     int ret;
 
     // Alloca dinamicamente major e minor number
-    ret = alloc_chrdev_region(&dev_num, 0, 1, "pubsub");
+    ret = alloc_chrdev_region(&pubsub_base_devt, 0, PUBSUB_MAX_TOPICS + 1, "pubsub");
     if (ret < 0) {
         pr_err("alloc_chrdev_region fallito: %d\n", ret);
         return ret;
     }
+    dev_num = MKDEV(MAJOR(pubsub_base_devt), 0);
 
     // Inizializza la struttura cdev e collega le operazioni
     cdev_init(&pubsub_cdev, &pubsub_fops);
@@ -181,7 +270,7 @@ static int __init pubsub_init(void)
     }
 
     // Aggiunge il nodo del cdev a /dev/
-    dev = device_create(pubsub_class, NULL, dev_num, NULL, "pubsub");
+    dev = device_create(pubsub_class, NULL, dev_num, NULL, "pubsub_ctrl");
     if (IS_ERR(dev)) {
         ret = PTR_ERR(dev);
         pr_err("device_create fallito: %d\n", ret);
@@ -196,7 +285,7 @@ err3:
 err2:
     cdev_del(&pubsub_cdev);
 err1:
-    unregister_chrdev_region(dev_num, 1);
+    unregister_chrdev_region(pubsub_base_devt, PUBSUB_MAX_TOPICS + 1);
     return ret;
 
 }
@@ -210,6 +299,7 @@ static void __exit pubsub_exit(void)
     // Distrugge i topic presenti nella lista
     list_for_each_entry_safe(t, tmp, &topic_list, list) {
         list_del(&t->list);
+        pubsub_topic_device_destroy(t);
         kfree(t);
     }
     
@@ -225,7 +315,11 @@ static void __exit pubsub_exit(void)
     cdev_del(&pubsub_cdev);
 
     // Rilascia major e minor number
-    unregister_chrdev_region(dev_num, 1);
+    unregister_chrdev_region(pubsub_base_devt, PUBSUB_MAX_TOPICS + 1);
+
+    // Distrugge l'allocatore dei minor number dei topic
+    ida_destroy(&pubsub_minor_ida);
+
     
     pr_info("pubsub rimosso correttamente\n");
 }
