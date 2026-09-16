@@ -8,6 +8,7 @@ all:
 	cp -f $(PWD)/*.c $(PWD)/*.h $(BUILDDIR)/ 2>/dev/null || true
 	cp -f $(PWD)/Makefile $(BUILDDIR)/Makefile.orig 2>/dev/null || true
 	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(BUILDDIR) src=$(PWD) modules
+	gcc -o $(BUILDDIR)/pubsub_test $(BUILDDIR)/pubsub_test.c
 
 clean:
 	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(BUILDDIR) src=$(PWD) clean

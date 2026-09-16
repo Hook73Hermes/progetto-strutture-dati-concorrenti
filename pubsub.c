@@ -2,6 +2,7 @@
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/fs.h>
+#include <linux/kref.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/mutex.h>
@@ -21,6 +22,7 @@ struct topic {
     dev_t dev_num;
     struct cdev cdev;
     struct device *device;
+    struct kref refcount;
 };
 
 static LIST_HEAD(topic_list);
@@ -33,11 +35,18 @@ static struct cdev pubsub_cdev;
 static struct class *pubsub_class;
 static DEFINE_IDA(pubsub_minor_ida);
 
+static void topic_free_kref(struct kref *kref)
+{
+    struct topic *t = container_of(kref, struct topic, refcount);
+    kfree(t);
+}
+
 static int topic_open(struct inode *inode, struct file *file)
 {
     struct topic *t = container_of(inode->i_cdev, struct topic, cdev);
 
     file->private_data = t;
+    kref_get(&t->refcount);
 
     if ((file->f_flags & O_ACCMODE) == O_WRONLY)
         pr_info("pubsub: publisher connesso al topic '%s'\n", t->name);
@@ -49,6 +58,9 @@ static int topic_open(struct inode *inode, struct file *file)
 
 static int topic_release(struct inode *inode, struct file *file)
 {
+    struct topic *t = file->private_data;
+    kref_put(&t->refcount, topic_free_kref);
+    
     return 0;
 }
 
@@ -140,6 +152,7 @@ static int pubsub_create_topic(struct pubsub_topic_req *topic_req)
 
     // Copia il nome del topic
     strscpy(t->name, topic_req->name, PUBSUB_MAX_NAME_LEN);
+    kref_init(&t->refcount);
 
     // Crea il device per il topic
     ret = pubsub_topic_device_create(t);
@@ -170,7 +183,7 @@ static int pubsub_destroy_topic(struct pubsub_topic_req *topic_req)
             list_del(&t->list);
             mutex_unlock(&topic_list_mutex);
             pubsub_topic_device_destroy(t);
-            kfree(t);
+            kref_put(&t->refcount, topic_free_kref);
             return 0;
         }
     }
@@ -300,7 +313,7 @@ static void __exit pubsub_exit(void)
     list_for_each_entry_safe(t, tmp, &topic_list, list) {
         list_del(&t->list);
         pubsub_topic_device_destroy(t);
-        kfree(t);
+        kref_put(&t->refcount, topic_free_kref);
     }
     
     mutex_unlock(&topic_list_mutex);
