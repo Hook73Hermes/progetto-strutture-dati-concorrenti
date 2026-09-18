@@ -20,5 +20,6 @@ struct pubsub_topic_list {
 #define PUBSUB_CREATE_TOPIC  _IOW(PUBSUB_IOC_MAGIC, 1, struct pubsub_topic_req)
 #define PUBSUB_DESTROY_TOPIC _IOW(PUBSUB_IOC_MAGIC, 2, struct pubsub_topic_req)
 #define PUBSUB_LIST_TOPICS   _IOR(PUBSUB_IOC_MAGIC, 3, struct pubsub_topic_list)
+#define PUBSUB_GET_DROPPED   _IOR(PUBSUB_IOC_MAGIC, 4, unsigned int)
 
 #endif
