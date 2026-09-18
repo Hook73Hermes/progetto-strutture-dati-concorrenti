@@ -1,3 +1,4 @@
 build/
+docs/
 pubsub_test.c
 pubsub_benchmark.c

@@ -21,6 +21,7 @@
 #define PUBSUB_QUEUE_DEPTH 64
 #define PUBSUB_MAX_MSG_SIZE 4096
 
+// Commentare la seguente riga per utilizzare RCU al posto dei RW-LOCK
 #define PUBSUB_USE_RWLOCK
 
 #ifdef PUBSUB_USE_RWLOCK
@@ -53,40 +54,40 @@ typedef spinlock_t subs_lock_t;
 
 // Lista dei subscriber per ogni singolo topic
 struct subscriber {
-    struct list_head list;
-    wait_queue_head_t wq;
-    spinlock_t lock;
-    unsigned int pending;
-    unsigned int dropped;
-    unsigned int queue_depth;
-    unsigned long next_seq;
-    unsigned long delivered_seq;
-    bool dead;
-    struct rcu_head rcu;
+    struct list_head list;                  // Lista subscriber del topic
+    wait_queue_head_t wq;                   // Coda di attesa per le letture (read(), poll(), delect())
+    spinlock_t lock;                        // Protegge i campi della struttura
+    unsigned int pending;                   // Messaggi in attesa di essere letti (contatore)
+    unsigned int dropped;                   // Messaggi persi per coda piena
+    unsigned long next_seq;                 // Prossimo sequence number da assegnare durante la write() successiva
+    unsigned long delivered_seq;            // Ultimo sequence number consegnato (incrementato in read())
+    bool dead;                              // true se il topic e' stato distrutto
+    struct rcu_head rcu;                    // Usato da kfree_rcu()
 };
 
-// Lista dei topic attivi protetta da mutex
+// Lista dei topic attivi
 struct topic {
-    char name[PUBSUB_MAX_NAME_LEN];
-    struct list_head list;
-    dev_t dev_num;
-    struct cdev cdev;
-    struct device *device;
-    struct kref refcount;
-    struct list_head subscribers;
-    subs_lock_t subs_lock;
+    char name[PUBSUB_MAX_NAME_LEN];         // Nome del topic (univoco)
+    struct list_head list;                  // Nodo nella lista globale dei topic
+    dev_t dev_num;                          // Major e minor allocati per il device di questo topic
+    struct cdev cdev;                       // Struttura cdev che collega dev_num a topic_fops
+    struct device *device;                  // Usato solo per device_destroy()
+    struct kref refcount;                   // Riferimenti attivi su questo topic
+    struct list_head subscribers;           // Lista dei subscriber correnti
+    subs_lock_t subs_lock;                  // Lock di scrittura sull'elenco subscriber
 };
 
 static LIST_HEAD(topic_list);
 static DEFINE_MUTEX(topic_list_mutex);
 
 // Variabili globali
-static dev_t dev_num;
-static dev_t pubsub_base_devt;
-static struct cdev pubsub_cdev;
-static struct class *pubsub_class;
-static DEFINE_IDA(pubsub_minor_ida);
+static dev_t dev_num;                       // Major e minor del device di controllo
+static dev_t pubsub_base_devt;              // Base major e minor allocata da alloc_chrdev_region
+static struct cdev pubsub_cdev;             // Struttura cdev del device di controllo, collegata a pubsub_fops
+static struct class *pubsub_class;          // Classe sysfs condivisa: usata per creare sia /dev/pubsub_ctrl che /dev/pubsub/<topic>
+static DEFINE_IDA(pubsub_minor_ida);        // Allocatore dei minor number per i topic (assegna e riusa quelli liberati da un topic distrutto)
 
+// Libera la memoria di un topic ricavando il puntatore da un campo
 static void topic_free_kref(struct kref *kref)
 {
     struct topic *t = container_of(kref, struct topic, refcount);
@@ -95,19 +96,19 @@ static void topic_free_kref(struct kref *kref)
 
 // Contesto di un file descriptor aperto su un topic
 struct topic_fd {
-    struct topic *topic;
-    struct subscriber *sub;
+    struct topic *topic;                    // Puntatore al topic associato
+    struct subscriber *sub;                 // Puntatore al subscriber associato (NULL se publisher)
 };
 
+// Apre un file descriptor su un topic, inizializza il contesto e incrementa il contatore di riferimenti
 static int topic_open(struct inode *inode, struct file *file)
 {
     struct topic *t = container_of(inode->i_cdev, struct topic, cdev);
     struct topic_fd *tfd;
 
     tfd = kzalloc(sizeof(*tfd), GFP_KERNEL);
-    if (!tfd) {
+    if (!tfd) 
         return -ENOMEM;
-    }
     
     tfd->topic = t;
     tfd->sub = NULL;
@@ -126,7 +127,6 @@ static int topic_open(struct inode *inode, struct file *file)
 
         init_waitqueue_head(&sub->wq);
         spin_lock_init(&sub->lock);
-        sub->queue_depth = PUBSUB_QUEUE_DEPTH;
 
         SUBS_WRITE_LOCK(&t->subs_lock);
         subs_list_add(&sub->list, &t->subscribers);
@@ -140,6 +140,7 @@ static int topic_open(struct inode *inode, struct file *file)
     return 0;
 }
 
+// Libera la memoria associata a un topic_fd
 static int topic_release(struct inode *inode, struct file *file)
 {
     struct topic_fd *tfd = file->private_data;
@@ -158,13 +159,14 @@ static int topic_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+// Scrive un messaggio su un topic
 static ssize_t topic_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
     struct topic_fd *tfd = file->private_data;
     struct topic *t = tfd->topic;
     struct subscriber *sub;
 
-    if (count > PUBSUB_MAX_MSG_SIZE)
+    if (count > PUBSUB_MAX_MSG_SIZE) 
         return -EMSGSIZE;
 
     SUBS_READ_LOCK(&t->subs_lock);
@@ -173,7 +175,7 @@ static ssize_t topic_write(struct file *file, const char __user *buf, size_t cou
         bool delivered = false;
 
         spin_lock_irqsave(&sub->lock, flags);
-        if (sub->pending < sub->queue_depth) {
+        if (sub->pending < PUBSUB_QUEUE_DEPTH) {
             sub->pending++;
             sub->next_seq++;
             delivered = true;
@@ -190,6 +192,7 @@ static ssize_t topic_write(struct file *file, const char __user *buf, size_t cou
     return count;
 }
 
+// Legge un messaggio da un topic
 static ssize_t topic_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
     struct topic_fd *tfd = file->private_data;
@@ -234,6 +237,7 @@ static ssize_t topic_read(struct file *file, char __user *buf, size_t count, lof
     return sizeof(seq);
 }
 
+// Gestisce le operazioni di polling per un topic
 static __poll_t topic_poll(struct file *file, poll_table *wait)
 {
     struct topic_fd *tfd = file->private_data;
@@ -241,9 +245,8 @@ static __poll_t topic_poll(struct file *file, poll_table *wait)
     __poll_t mask = 0;
     unsigned long flags;
 
-    if (!sub) {
+    if (!sub)
         return EPOLLOUT | EPOLLWRNORM;
-    }
 
     poll_wait(file, &sub->wq, wait);
 
@@ -257,6 +260,7 @@ static __poll_t topic_poll(struct file *file, poll_table *wait)
     return mask;
 }
 
+// Gestisce le operazioni di ioctl per un topic
 static long topic_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct topic_fd *tfd = file->private_data;
@@ -281,6 +285,7 @@ static long topic_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
 }
 
+// Definisce le operazioni di file per un topic
 static struct file_operations topic_fops = {
     .owner = THIS_MODULE,
     .open = topic_open,
@@ -291,6 +296,7 @@ static struct file_operations topic_fops = {
     .unlocked_ioctl = topic_ioctl,
 };
 
+// Crea il device per il topic
 static int pubsub_topic_device_create(struct topic *t)
 {
     int minor;
@@ -326,33 +332,35 @@ static int pubsub_topic_device_create(struct topic *t)
     return 0;
 }
 
+// Distrugge il device per il topic rimuovendolo dal kernel
 static void pubsub_topic_device_destroy(struct topic *t)
 {
-    // Rimuove il device per il topic
     device_destroy(pubsub_class, t->dev_num);
     cdev_del(&t->cdev);
     ida_free(&pubsub_minor_ida, MINOR(t->dev_num));
 }
 
+// Apre il device per il topic
 static int pubsub_open(struct inode *inode, struct file *file)
 {
     return 0;
 }
 
+// Chiude il device per il topic
 static int pubsub_release(struct inode *inode, struct file *file)
 {
     return 0;
 }
 
+// Crea il topic
 static int pubsub_create_topic(struct pubsub_topic_req *topic_req)
 {
     struct topic *t;
     int ret;
 
     // Verifica che il nome sia non nullo
-    if (!topic_req || !topic_req->name[0]) {
+    if (!topic_req || !topic_req->name[0])
         return -EINVAL;
-    }
 
     mutex_lock(&topic_list_mutex);
 
@@ -385,7 +393,6 @@ static int pubsub_create_topic(struct pubsub_topic_req *topic_req)
         return ret;
     }
 
-
     // Inserisce il topic nella lista
     list_add_tail(&t->list, &topic_list);
     
@@ -394,6 +401,7 @@ static int pubsub_create_topic(struct pubsub_topic_req *topic_req)
     return 0;
 }
 
+// Sveglia tutti i subscriber del topic
 static void topic_wake_all_subscribers(struct topic *t)
 {
     struct subscriber *sub;
@@ -411,6 +419,7 @@ static void topic_wake_all_subscribers(struct topic *t)
     SUBS_WRITE_UNLOCK(&t->subs_lock);
 }
 
+// Distrugge il topic
 static int pubsub_destroy_topic(struct pubsub_topic_req *topic_req)
 {
     struct topic *t;
@@ -433,6 +442,7 @@ static int pubsub_destroy_topic(struct pubsub_topic_req *topic_req)
     return -ENOENT;
 }
 
+// Elenca tutti i topic
 static int pubsub_list_topics(struct pubsub_topic_list *truncated_topic_list)
 {
     struct topic *t;
@@ -440,7 +450,7 @@ static int pubsub_list_topics(struct pubsub_topic_list *truncated_topic_list)
 
     mutex_lock(&topic_list_mutex);
 
-    // Aggiunge i nomi dei topic alla lista
+    // Aggiunge i nomi dei topic alla lista di ritorno all'utente
     list_for_each_entry(t, &topic_list, list) {
         if (count >= PUBSUB_MAX_LISTED_TOPICS)
             break;
@@ -455,13 +465,13 @@ static int pubsub_list_topics(struct pubsub_topic_list *truncated_topic_list)
     return 0;
 }
 
+// Gestisce le operazioni di I/O sulla lista dei topic
 static long pubsub_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct pubsub_topic_req topic_req;
     struct pubsub_topic_list truncated_topic_list;
     int ret;
 
-    // Gestisce le operazioni di I/O sulla lista dei topic
     switch (cmd) {
         case PUBSUB_CREATE_TOPIC:
             if (copy_from_user(&topic_req, (struct pubsub_topic_req __user *)arg, sizeof(topic_req)))
@@ -485,6 +495,7 @@ static long pubsub_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     return ret;
 }
 
+// Definisce le operazioni di file per il device
 static struct file_operations pubsub_fops = {
     .owner = THIS_MODULE,
     .open = pubsub_open,
@@ -492,6 +503,7 @@ static struct file_operations pubsub_fops = {
     .unlocked_ioctl = pubsub_ioctl,
 };
 
+// Inizializza il modulo
 static int __init pubsub_init(void) 
 {
     struct device *dev;
@@ -544,6 +556,7 @@ err1:
 
 }
 
+// Distrugge il modulo
 static void __exit pubsub_exit(void)
 {
     struct topic *t, *tmp;
