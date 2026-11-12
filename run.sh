@@ -14,5 +14,5 @@ cleanup() {
 }
 trap cleanup EXIT
 
-./setup.sh
+./setup.sh 2> /dev/null
 ./build/pubsub_benchmark "$@"

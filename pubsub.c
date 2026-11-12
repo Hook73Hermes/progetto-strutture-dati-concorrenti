@@ -56,6 +56,24 @@ typedef spinlock_t subs_lock_t;
 
 #endif
 
+// Variante esposta in sola lettura in /sys/module/pubsub/parameters/variant
+static int variant_set(const char *val, const struct kernel_param *kp)
+{
+    return -EPERM;
+}
+
+static int variant_get(char *buf, const struct kernel_param *kp)
+{
+    return sysfs_emit(buf, "%s\n", SUBS_VARIANT);
+}
+
+static const struct kernel_param_ops variant_ops = {
+    .set = variant_set,
+    .get = variant_get,
+};
+module_param_cb(variant, &variant_ops, NULL, 0444);
+MODULE_PARM_DESC(variant, "Variante di sincronizzazione della lista subscriber (sola lettura)");
+
 // Lista dei subscriber per ogni singolo topic
 struct subscriber {
     struct list_head list;                  // Lista subscriber del topic
