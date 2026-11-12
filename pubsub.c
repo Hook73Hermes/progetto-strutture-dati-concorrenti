@@ -21,11 +21,14 @@
 #define PUBSUB_QUEUE_DEPTH 64
 #define PUBSUB_MAX_MSG_SIZE 4096
 
-// Commentare la seguente riga per utilizzare RCU al posto dei RW-LOCK
+// Variante scelta in compilazione: "make" usa i RW-LOCK, "make RCU=y" usa RCU
+#ifndef PUBSUB_USE_RCU
 #define PUBSUB_USE_RWLOCK
+#endif
 
 #ifdef PUBSUB_USE_RWLOCK
 
+#define SUBS_VARIANT                   "rwlock"
 typedef rwlock_t subs_lock_t;
 #define SUBS_LOCK_INIT(l)              rwlock_init(l)
 #define SUBS_WRITE_LOCK(l)             write_lock(l)
@@ -39,6 +42,7 @@ typedef rwlock_t subs_lock_t;
 
 #else
 
+#define SUBS_VARIANT                   "rcu"
 typedef spinlock_t subs_lock_t;
 #define SUBS_LOCK_INIT(l)              spin_lock_init(l)
 #define SUBS_WRITE_LOCK(l)             spin_lock(l)
@@ -55,7 +59,7 @@ typedef spinlock_t subs_lock_t;
 // Lista dei subscriber per ogni singolo topic
 struct subscriber {
     struct list_head list;                  // Lista subscriber del topic
-    wait_queue_head_t wq;                   // Coda di attesa per le letture (read(), poll(), delect())
+    wait_queue_head_t wq;                   // Coda di attesa per le letture (read(), poll(), select())
     spinlock_t lock;                        // Protegge i campi della struttura
     unsigned int pending;                   // Messaggi in attesa di essere letti (contatore)
     unsigned int dropped;                   // Messaggi persi per coda piena
@@ -70,7 +74,7 @@ struct topic {
     char name[PUBSUB_MAX_NAME_LEN];         // Nome del topic (univoco)
     struct list_head list;                  // Nodo nella lista globale dei topic
     dev_t dev_num;                          // Major e minor allocati per il device di questo topic
-    struct cdev cdev;                       // Struttura cdev che collega dev_num a topic_fops
+    struct cdev *cdev;                      // cdev allocato con cdev_alloc(): ha un ciclo di vita proprio, separato dal topic
     struct device *device;                  // Usato solo per device_destroy()
     struct kref refcount;                   // Riferimenti attivi su questo topic
     struct list_head subscribers;           // Lista dei subscriber correnti
@@ -103,38 +107,56 @@ struct topic_fd {
 // Apre un file descriptor su un topic, inizializza il contesto e incrementa il contatore di riferimenti
 static int topic_open(struct inode *inode, struct file *file)
 {
-    struct topic *t = container_of(inode->i_cdev, struct topic, cdev);
+    struct topic *t = NULL, *pos;
     struct topic_fd *tfd;
+    struct subscriber *sub = NULL;
 
     tfd = kzalloc(sizeof(*tfd), GFP_KERNEL);
     if (!tfd) 
         return -ENOMEM;
-    
-    tfd->topic = t;
-    tfd->sub = NULL;
-    kref_get(&t->refcount);
 
-    if ((file->f_flags & O_ACCMODE) == O_WRONLY) {
-        pr_info("pubsub: publisher connesso al topic '%s'\n", t->name);
-    } else if ((file->f_flags & O_ACCMODE) == O_RDONLY) {
-        struct subscriber *sub = kzalloc(sizeof(*sub), GFP_KERNEL);
-
+    if ((file->f_flags & O_ACCMODE) == O_RDONLY) {
+        sub = kzalloc(sizeof(*sub), GFP_KERNEL);
         if (!sub) {
-            kref_put(&t->refcount, topic_free_kref);
             kfree(tfd);
             return -ENOMEM;
         }
-
         init_waitqueue_head(&sub->wq);
         spin_lock_init(&sub->lock);
+    }
 
+    // Il topic si cerca nella lista sotto mutex: se una destroy lo ha gia' rimosso l'open fallisce,
+    mutex_lock(&topic_list_mutex);
+    list_for_each_entry(pos, &topic_list, list) {
+        if (pos->dev_num == inode->i_rdev) {
+            t = pos;
+            break;
+        }
+    }
+
+    if (!t) {
+        mutex_unlock(&topic_list_mutex);
+        kfree(sub);
+        kfree(tfd);
+        return -ENODEV;
+    }
+
+    kref_get(&t->refcount);
+    tfd->topic = t;
+    tfd->sub = sub;
+
+    if (sub) {
         SUBS_WRITE_LOCK(&t->subs_lock);
         subs_list_add(&sub->list, &t->subscribers);
         SUBS_WRITE_UNLOCK(&t->subs_lock);
-
-        tfd->sub = sub;
-        pr_info("pubsub: subscriber connesso al topic '%s'\n", t->name);
     }
+
+    mutex_unlock(&topic_list_mutex);
+
+    if (sub)
+        pr_debug("pubsub: subscriber connesso al topic '%s'\n", t->name);
+    else if ((file->f_flags & O_ACCMODE) == O_WRONLY)
+        pr_debug("pubsub: publisher connesso al topic '%s'\n", t->name);
 
     file->private_data = tfd;
     return 0;
@@ -309,13 +331,19 @@ static int pubsub_topic_device_create(struct topic *t)
 
     t->dev_num = MKDEV(MAJOR(pubsub_base_devt), minor);
 
-    // Inizializza la struttura cdev per il topic
-    cdev_init(&t->cdev, &topic_fops);
-    t->cdev.owner = THIS_MODULE;
+    // Alloca la struttura cdev per il topic: viene liberata dal kernel quando l'ultimo riferimento viene rilasciato, indipendentemente dal topic
+    t->cdev = cdev_alloc();
+    if (!t->cdev) {
+        ida_free(&pubsub_minor_ida, minor);
+        return -ENOMEM;
+    }
+    t->cdev->ops = &topic_fops;
+    t->cdev->owner = THIS_MODULE;
 
     // Aggiunge la struttura cdev al kernel
-    ret = cdev_add(&t->cdev, t->dev_num, 1);
+    ret = cdev_add(t->cdev, t->dev_num, 1);
     if (ret < 0) {
+        kobject_put(&t->cdev->kobj);
         ida_free(&pubsub_minor_ida, minor);
         return ret;
     }
@@ -324,7 +352,7 @@ static int pubsub_topic_device_create(struct topic *t)
     t->device = device_create(pubsub_class, NULL, t->dev_num, NULL, "pubsub/%s", t->name);
     if (IS_ERR(t->device)) {
         ret = PTR_ERR(t->device);
-        cdev_del(&t->cdev);
+        cdev_del(t->cdev);
         ida_free(&pubsub_minor_ida, minor);
         return ret;
     }
@@ -336,17 +364,17 @@ static int pubsub_topic_device_create(struct topic *t)
 static void pubsub_topic_device_destroy(struct topic *t)
 {
     device_destroy(pubsub_class, t->dev_num);
-    cdev_del(&t->cdev);
+    cdev_del(t->cdev);
     ida_free(&pubsub_minor_ida, MINOR(t->dev_num));
 }
 
-// Apre il device per il topic
+// Apre il device di controllo
 static int pubsub_open(struct inode *inode, struct file *file)
 {
     return 0;
 }
 
-// Chiude il device per il topic
+// Chiude il device di controllo
 static int pubsub_release(struct inode *inode, struct file *file)
 {
     return 0;
@@ -448,6 +476,8 @@ static int pubsub_list_topics(struct pubsub_topic_list *truncated_topic_list)
     struct topic *t;
     int count = 0;
 
+    memset(truncated_topic_list, 0, sizeof(*truncated_topic_list));
+
     mutex_lock(&topic_list_mutex);
 
     // Aggiunge i nomi dei topic alla lista di ritorno all'utente
@@ -543,7 +573,7 @@ static int __init pubsub_init(void)
         goto err3;
     }
 
-    pr_info("pubsub montato correttamente\n");
+    pr_info("pubsub montato correttamente (variante: %s)\n", SUBS_VARIANT);
     return 0;
 
 err3:
@@ -596,5 +626,6 @@ module_init(pubsub_init);
 module_exit(pubsub_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_INFO(variant, SUBS_VARIANT);
 MODULE_AUTHOR("Luca Maietti");
 MODULE_DESCRIPTION("Implementazione di protocollo pub/sub concorrente per fini didattici universitari");
